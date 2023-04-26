@@ -4057,7 +4057,7 @@ static inline bool IsConditionOnFloatingPointValues(HInstruction* condition) {
 }
 
 static inline Condition GetConditionForSelect(HCondition* condition) {
-  IfCondition cond = condition->AsCondition()->GetCondition();
+  IfCondition cond = condition->GetCondition();
   return IsConditionOnFloatingPointValues(condition) ? ARM64FPCondition(cond, condition->IsGtBias())
                                                      : ARM64Condition(cond);
 }
