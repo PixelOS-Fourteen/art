@@ -702,10 +702,6 @@ void MarkCompact::RunPhases() {
       bump_pointer_space_->AssertAllThreadLocalBuffersAreRevoked();
     }
   }
-  // To increase likelihood of black allocations. For testing purposes only.
-  if (kIsDebugBuild && heap_->GetTaskProcessor()->GetRunningThread() == thread_running_gc_) {
-    usleep(500'000);
-  }
   {
     ReaderMutexLock mu(self, *Locks::mutator_lock_);
     ReclaimPhase();
@@ -735,7 +731,6 @@ void MarkCompact::RunPhases() {
 
   FinishPhase();
   thread_running_gc_ = nullptr;
-  GetHeap()->PostGcVerification(this);
 }
 
 void MarkCompact::InitMovingSpaceFirstObjects(const size_t vec_len) {
