@@ -151,6 +151,8 @@ art_module_art_global_defaults {
 
         // Enable thread annotations for std::mutex, etc.
         "-D_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS",
+        
+        "-O3",
     ],
 
     arch: {
