@@ -249,7 +249,7 @@ void CommonCompilerTestImpl::OverrideInstructionSetFeatures(InstructionSet instr
 }
 
 void CommonCompilerTestImpl::SetUpRuntimeOptionsImpl() {
-  compiler_options_.reset(new CompilerOptions);
+  compiler_options_ = CreateCompilerOptions(instruction_set_, "default");
   ApplyInstructionSet();
 }
 
