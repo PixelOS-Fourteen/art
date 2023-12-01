@@ -227,6 +227,10 @@ class CompilerOptions final {
     return baseline_;
   }
 
+  bool ProfileBranches() const {
+    return profile_branches_;
+  }
+
   // Are we compiling an app image?
   bool IsAppImage() const {
     return image_type_ == ImageType::kAppImage;
@@ -434,6 +438,7 @@ class CompilerOptions final {
   bool dump_timings_;
   bool dump_pass_timings_;
   bool dump_stats_;
+  bool profile_branches_;
 
   // When using a profile file only the top K% of the profiled samples will be compiled.
   double top_k_profile_threshold_;

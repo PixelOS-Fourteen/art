@@ -64,6 +64,7 @@ CompilerOptions::CompilerOptions()
       dump_timings_(false),
       dump_pass_timings_(false),
       dump_stats_(false),
+      profile_branches_(false),
       top_k_profile_threshold_(kDefaultTopKProfileThreshold),
       profile_compilation_info_(nullptr),
       verbose_methods_(),

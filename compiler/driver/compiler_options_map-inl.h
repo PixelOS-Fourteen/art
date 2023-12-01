@@ -69,6 +69,9 @@ inline bool ReadCompilerOptions(Base& map, CompilerOptions* options, std::string
   if (map.Exists(Base::Baseline)) {
     options->baseline_ = true;
   }
+  if (map.Exists(Base::ProfileBranches)) {
+    options->profile_branches_ = true;
+  }
   map.AssignIfExists(Base::TopKProfileThreshold, &options->top_k_profile_threshold_);
   map.AssignIfExists(Base::AbortOnHardVerifierFailure, &options->abort_on_hard_verifier_failure_);
   map.AssignIfExists(Base::AbortOnSoftVerifierFailure, &options->abort_on_soft_verifier_failure_);
@@ -205,6 +208,10 @@ inline void AddCompilerOptionsArgumentParserOptions(Builder& b) {
       .Define("--baseline")
           .WithHelp("Produce code using the baseline compilation")
           .IntoKey(Map::Baseline)
+
+      .Define("--profile-branches")
+          .WithHelp("Profile branches in baseline generated code")
+          .IntoKey(Map::ProfileBranches)
 
       .Define("--top-k-profile-threshold=_")
           .template WithType<double>().WithRange(0.0, 100.0)
