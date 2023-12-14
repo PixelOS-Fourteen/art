@@ -2402,7 +2402,7 @@ void ClassLinker::VisitClassRoots(RootVisitor* visitor, VisitRootFlags flags) {
       if (!heap->IsPerformingUffdCompaction()) {
         for (const ClassLoaderData& data : class_loaders_) {
           GcRoot<mirror::Object> root(GcRoot<mirror::Object>(self->DecodeJObject(data.weak_root)));
-          root.VisitRoot(visitor, RootInfo(kRootVMInternal));
+          root.VisitRootIfNonNull(visitor, RootInfo(kRootVMInternal));
         }
       } else {
         DCHECK_EQ(heap->CurrentCollectorType(), gc::CollectorType::kCollectorTypeCMC);
