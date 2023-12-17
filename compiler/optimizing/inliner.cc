@@ -674,9 +674,14 @@ HInliner::InlineCacheType HInliner::GetInlineCacheJIT(
     return kInlineCacheNoData;
   }
 
-  Runtime::Current()->GetJit()->GetCodeCache()->CopyInlineCacheInto(
-      *profiling_info->GetInlineCache(invoke_instruction->GetDexPc()),
-      classes);
+  InlineCache* cache = profiling_info->GetInlineCache(invoke_instruction->GetDexPc());
+  if (cache == nullptr) {
+    // This shouldn't happen, but be robust, warn about it, and return that we
+    // don't have any inline cache data.
+    LOG(WARNING) << "No inline cache found for " << caller->PrettyMethod();
+    return kInlineCacheNoData;
+  }
+  Runtime::Current()->GetJit()->GetCodeCache()->CopyInlineCacheInto(*cache, classes);
   return GetInlineCacheType(*classes);
 }
 
