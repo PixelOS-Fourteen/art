@@ -443,6 +443,9 @@ static bool AlwaysThrows(ArtMethod* method)
 }
 
 bool HInliner::TryInline(HInvoke* invoke_instruction) {
+  if (invoke_instruction == nullptr) {
+      return false;
+  }
   MaybeRecordStat(stats_, MethodCompilationStat::kTryInline);
 
   // Don't bother to move further if we know the method is unresolved or the invocation is
