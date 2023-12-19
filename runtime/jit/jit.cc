@@ -262,10 +262,6 @@ bool Jit::CompileMethodInternal(ArtMethod* method,
                                 Thread* self,
                                 CompilationKind compilation_kind,
                                 bool prejit) {
-  if (kIsDebugBuild) {
-    MutexLock mu(self, *Locks::jit_lock_);
-    CHECK(GetCodeCache()->IsMethodBeingCompiled(method, compilation_kind));
-  }
   DCHECK(Runtime::Current()->UseJitCompilation());
   DCHECK(!method->IsRuntimeMethod());
 
@@ -749,51 +745,6 @@ void Jit::NotifyZygoteCompilationDone() {
   child_mapping_methods.Reset();
 }
 
-class ScopedCompilation {
- public:
-  ScopedCompilation(ScopedCompilation&& other) noexcept :
-      jit_(other.jit_),
-      method_(other.method_),
-      compilation_kind_(other.compilation_kind_),
-      owns_compilation_(other.owns_compilation_) {
-    other.owns_compilation_ = false;
-  }
-
-  ScopedCompilation(Jit* jit, ArtMethod* method, CompilationKind compilation_kind)
-      : jit_(jit),
-        method_(method),
-        compilation_kind_(compilation_kind),
-        owns_compilation_(true) {
-    MutexLock mu(Thread::Current(), *Locks::jit_lock_);
-    // We don't want to enqueue any new tasks when thread pool has stopped. This simplifies
-    // the implementation of redefinition feature in jvmti.
-    if (jit_->GetThreadPool() == nullptr ||
-        !jit_->GetThreadPool()->HasStarted(Thread::Current()) ||
-        jit_->GetCodeCache()->IsMethodBeingCompiled(method_, compilation_kind_)) {
-      owns_compilation_ = false;
-      return;
-    }
-    jit_->GetCodeCache()->AddMethodBeingCompiled(method_, compilation_kind_);
-  }
-
-  bool OwnsCompilation() const {
-    return owns_compilation_;
-  }
-
-  ~ScopedCompilation() {
-    if (owns_compilation_) {
-      MutexLock mu(Thread::Current(), *Locks::jit_lock_);
-      jit_->GetCodeCache()->RemoveMethodBeingCompiled(method_, compilation_kind_);
-    }
-  }
-
- private:
-  Jit* const jit_;
-  ArtMethod* const method_;
-  const CompilationKind compilation_kind_;
-  bool owns_compilation_;
-};
-
 class JitCompileTask final : public Task {
  public:
   enum class TaskKind {
@@ -803,15 +754,10 @@ class JitCompileTask final : public Task {
 
   JitCompileTask(ArtMethod* method,
                  TaskKind task_kind,
-                 CompilationKind compilation_kind,
-                 ScopedCompilation&& sc)
+                 CompilationKind compilation_kind)
       : method_(method),
         kind_(task_kind),
-        compilation_kind_(compilation_kind),
-        scoped_compilation_(std::move(sc)) {
-    DCHECK(scoped_compilation_.OwnsCompilation());
-    DCHECK(!sc.OwnsCompilation());
-  }
+        compilation_kind_(compilation_kind) {}
 
   void Run(Thread* self) override {
     {
@@ -839,7 +785,6 @@ class JitCompileTask final : public Task {
   ArtMethod* const method_;
   const TaskKind kind_;
   const CompilationKind compilation_kind_;
-  ScopedCompilation scoped_compilation_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(JitCompileTask);
 };
@@ -1334,15 +1279,12 @@ void Jit::AddCompileTask(Thread* self,
                          ArtMethod* method,
                          CompilationKind compilation_kind,
                          bool precompile) {
-  ScopedCompilation sc(this, method, compilation_kind);
-  if (!sc.OwnsCompilation()) {
-    return;
-  }
   JitCompileTask::TaskKind task_kind = precompile
       ? JitCompileTask::TaskKind::kPreCompile
       : JitCompileTask::TaskKind::kCompile;
-  thread_pool_->AddTask(
-      self, new JitCompileTask(method, task_kind, compilation_kind, std::move(sc)));
+  if (thread_pool_ != nullptr &&  thread_pool_->HasStarted(self)) {
+    thread_pool_->AddTask(self, new JitCompileTask(method, task_kind, compilation_kind));
+  }
 }
 
 bool Jit::CompileMethodFromProfile(Thread* self,
@@ -1377,15 +1319,11 @@ bool Jit::CompileMethodFromProfile(Thread* self,
     VLOG(jit) << "JIT Zygote processing method " << ArtMethod::PrettyMethod(method)
               << " from profile";
     method->SetPreCompiled();
-    ScopedCompilation sc(this, method, compilation_kind);
-    if (!sc.OwnsCompilation()) {
-      return false;
-    }
     if (!add_to_queue) {
       CompileMethodInternal(method, self, compilation_kind, /* prejit= */ true);
     } else {
       Task* task = new JitCompileTask(
-          method, JitCompileTask::TaskKind::kPreCompile, compilation_kind, std::move(sc));
+          method, JitCompileTask::TaskKind::kPreCompile, compilation_kind);
       if (compile_after_boot) {
         AddPostBootTask(self, task);
       } else {
@@ -1836,16 +1774,19 @@ bool Jit::CompileMethod(ArtMethod* method,
                         Thread* self,
                         CompilationKind compilation_kind,
                         bool prejit) {
-  ScopedCompilation sc(this, method, compilation_kind);
-  // TODO: all current users of this method expect us to wait if it is being compiled.
-  if (!sc.OwnsCompilation()) {
-    return false;
-  }
   // Fake being in a runtime thread so that class-load behavior will be the same as normal jit.
   ScopedSetRuntimeThread ssrt(self);
   // TODO(ngeoffray): For JIT at first use, use kPreCompile. Currently we don't due to
   // conflicts with jitzygote optimizations.
   return CompileMethodInternal(method, self, compilation_kind, prejit);
+}
+
+bool Jit::IsActive(Thread* self) {
+  Jit* jit = Runtime::Current()->GetJit();
+  if (jit == nullptr || jit->GetThreadPool() == nullptr) {
+    return false;
+  }
+  return jit->GetThreadPool()->IsActive(self);
 }
 
 }  // namespace jit
