@@ -244,12 +244,12 @@ cc_defaults {
     target: {
         android_arm64: {
             pgo: {
-                profile_file: "art/dex2oat_arm_arm64.profdata",
+                profile_file: "art/dex2oat_arm_arm64.profdata.2023-05-19",
             },
         },
         android_arm: {
             pgo: {
-                profile_file: "art/dex2oat_arm_arm64.profdata",
+                profile_file: "art/dex2oat_arm_arm64.profdata.2023-05-19",
             },
         },
         android_riscv64: {
