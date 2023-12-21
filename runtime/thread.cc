@@ -2460,6 +2460,7 @@ Thread::Thread(bool daemon)
       wait_monitor_(nullptr),
       is_runtime_thread_(false) {
   wait_mutex_ = new Mutex("a thread wait mutex", LockLevel::kThreadWaitLock);
+  collect_stack_mutex_ = new Mutex("a collect thread stack mutex", LockLevel::kDefaultMutexLevel);
   wait_cond_ = new ConditionVariable("a thread wait condition variable", *wait_mutex_);
   tlsPtr_.mutator_lock = Locks::mutator_lock_;
   DCHECK(tlsPtr_.mutator_lock != nullptr);

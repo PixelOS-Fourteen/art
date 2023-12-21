@@ -543,7 +543,14 @@ void Mutex::DumpStack(Thread* self, uint64_t wait_start_ms, uint64_t try_times) 
       std::ostringstream oss;
     };
     CollectStackTrace owner_trace;
-    owner->RequestSynchronousCheckpoint(&owner_trace);
+    if (owner->GetCollectStackMutex()->ExclusiveTryLockWithSpinning(self)) {
+      owner->RequestSynchronousCheckpoint(&owner_trace);
+      owner->GetCollectStackMutex()->ExclusiveUnlock(self);
+    } else {
+      LOG(WARNING) << "Contention with tid " << owner_tid << ", monitor id " << monitor_id_;
+      Locks::thread_list_lock_->ExclusiveUnlock(self);
+      return;
+    }
     owner_stack_dump = owner_trace.oss.str();
     uint64_t wait_ms = MilliTime() - wait_start_ms;
     LOG(WARNING) << "Monitor contention with tid " << owner_tid << ", wait time: " << wait_ms

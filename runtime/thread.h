@@ -696,6 +696,10 @@ class Thread {
     return wait_mutex_;
   }
 
+  Mutex* GetCollectStackMutex() const LOCK_RETURNED(collect_stack_mutex_) {
+    return collect_stack_mutex_;
+  }
+
   ConditionVariable* GetWaitConditionVariable() const REQUIRES(wait_mutex_) {
     return wait_cond_;
   }
@@ -2139,6 +2143,10 @@ class Thread {
 
   // Guards the 'wait_monitor_' members.
   Mutex* wait_mutex_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+
+  // This is used to guards against multiple threads trying to request synchronous checkpoint
+  // for dump java stack of the same thread.
+  Mutex* collect_stack_mutex_ DEFAULT_MUTEX_ACQUIRED_AFTER;
 
   // Condition variable waited upon during a wait.
   ConditionVariable* wait_cond_ GUARDED_BY(wait_mutex_);
