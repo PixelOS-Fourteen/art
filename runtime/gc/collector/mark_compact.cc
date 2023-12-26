@@ -287,7 +287,7 @@ static constexpr size_t kMaxNumUffdWorkers = 2;
 // phase.
 static constexpr size_t kMutatorCompactionBufferCount = 2048;
 // Minimum from-space chunk to be madvised (during concurrent compaction) in one go.
-static constexpr ssize_t kMinFromSpaceMadviseSize = 1 * MB;
+static constexpr ssize_t kMinFromSpaceMadviseSize = 8 * MB;
 // Concurrent compaction termination logic is different (and slightly more efficient) if the
 // kernel has the fault-retry feature (allowing repeated faults on the same page), which was
 // introduced in 5.7 (https://android-review.git.corp.google.com/c/kernel/common/+/1540088).
@@ -381,14 +381,17 @@ size_t MarkCompact::InitializeInfoMap(uint8_t* p, size_t moving_space_sz) {
   vector_length_ = moving_space_sz / kOffsetChunkSize;
   size_t total = vector_length_ * sizeof(uint32_t);
 
-  first_objs_non_moving_space_ = reinterpret_cast<ObjReference*>(p + total);
-  total += heap_->GetNonMovingSpace()->Capacity() / kPageSize * sizeof(ObjReference);
-
   first_objs_moving_space_ = reinterpret_cast<ObjReference*>(p + total);
   total += nr_moving_pages * sizeof(ObjReference);
 
   pre_compact_offset_moving_space_ = reinterpret_cast<uint32_t*>(p + total);
   total += nr_moving_pages * sizeof(uint32_t);
+
+  moving_pages_status_ = reinterpret_cast<Atomic<uint32_t>*>(p + total);
+  total += nr_moving_pages * sizeof(Atomic<uint32_t>);
+
+  first_objs_non_moving_space_ = reinterpret_cast<ObjReference*>(p + total);
+  total += heap_->GetNonMovingSpace()->Capacity() / kPageSize * sizeof(ObjReference);
   return total;
 }
 
@@ -432,26 +435,27 @@ MarkCompact::MarkCompact(Heap* heap)
           reinterpret_cast<uintptr_t>(bump_pointer_space_->Begin()),
           reinterpret_cast<uintptr_t>(bump_pointer_space_->Limit())));
 
-  // Create one MemMap for all the data structures
-  size_t moving_space_size = bump_pointer_space_->Capacity();
-  size_t chunk_info_vec_size = moving_space_size / kOffsetChunkSize;
-  size_t nr_moving_pages = moving_space_size / kPageSize;
-  size_t nr_non_moving_pages = heap->GetNonMovingSpace()->Capacity() / kPageSize;
-
   std::string err_msg;
-  info_map_ = MemMap::MapAnonymous("Concurrent mark-compact chunk-info vector",
-                                   chunk_info_vec_size * sizeof(uint32_t)
-                                   + nr_non_moving_pages * sizeof(ObjReference)
-                                   + nr_moving_pages * sizeof(ObjReference)
-                                   + nr_moving_pages * sizeof(uint32_t),
-                                   PROT_READ | PROT_WRITE,
-                                   /*low_4gb=*/ false,
-                                   &err_msg);
-  if (UNLIKELY(!info_map_.IsValid())) {
-    LOG(FATAL) << "Failed to allocate concurrent mark-compact chunk-info vector: " << err_msg;
-  } else {
-    size_t total = InitializeInfoMap(info_map_.Begin(), moving_space_size);
-    DCHECK_EQ(total, info_map_.Size());
+  size_t moving_space_size = bump_pointer_space_->Capacity();
+  {
+    // Create one MemMap for all the data structures
+    size_t chunk_info_vec_size = moving_space_size / kOffsetChunkSize;
+    size_t nr_moving_pages = moving_space_size / kPageSize;
+    size_t nr_non_moving_pages = heap->GetNonMovingSpace()->Capacity() / kPageSize;
+    size_t size =
+        chunk_info_vec_size * sizeof(uint32_t) + nr_non_moving_pages * sizeof(ObjReference) +
+        nr_moving_pages * (sizeof(ObjReference) + sizeof(uint32_t) + sizeof(Atomic<uint32_t>));
+    info_map_ = MemMap::MapAnonymous("Concurrent mark-compact chunk-info vector",
+                                     size,
+                                     PROT_READ | PROT_WRITE,
+                                     /*low_4gb=*/false,
+                                     &err_msg);
+    if (UNLIKELY(!info_map_.IsValid())) {
+      LOG(FATAL) << "Failed to allocate concurrent mark-compact chunk-info vector: " << err_msg;
+    } else {
+      size_t total = InitializeInfoMap(info_map_.Begin(), moving_space_size);
+      DCHECK_EQ(total, info_map_.Size());
+    }
   }
 
   size_t moving_space_alignment = BestPageTableAlignment(moving_space_size);
@@ -820,11 +824,12 @@ void MarkCompact::InitMovingSpaceFirstObjects(const size_t vec_len) {
   size_t chunk_idx;
   // Find the first live word in the space
   for (chunk_idx = 0; chunk_info_vec_[chunk_idx] == 0; chunk_idx++) {
-    if (chunk_idx > vec_len) {
+    if (chunk_idx >= vec_len) {
       // We don't have any live data on the moving-space.
       return;
     }
   }
+  DCHECK_LT(chunk_idx, vec_len);
   // Use live-words bitmap to find the first word
   offset_in_chunk_word = live_words_bitmap_->FindNthLiveWordOffset(chunk_idx, /*n*/ 0);
   offset = chunk_idx * kBitsPerVectorWord + offset_in_chunk_word;
@@ -845,7 +850,7 @@ void MarkCompact::InitMovingSpaceFirstObjects(const size_t vec_len) {
   uint32_t page_live_bytes = 0;
   while (true) {
     for (; page_live_bytes <= kPageSize; chunk_idx++) {
-      if (chunk_idx > vec_len) {
+      if (chunk_idx >= vec_len) {
         moving_first_objs_count_ = to_space_page_idx;
         return;
       }
@@ -2050,27 +2055,27 @@ void MarkCompact::ZeropageIoctl(void* addr, bool tolerate_eexist, bool tolerate_
   }
 }
 
-void MarkCompact::CopyIoctl(void* dst, void* buffer) {
+void MarkCompact::CopyIoctl(void* dst, void* buffer, size_t length) {
   struct uffdio_copy uffd_copy;
   uffd_copy.src = reinterpret_cast<uintptr_t>(buffer);
   uffd_copy.dst = reinterpret_cast<uintptr_t>(dst);
-  uffd_copy.len = kPageSize;
+  uffd_copy.len = length;
   uffd_copy.mode = 0;
   CHECK_EQ(ioctl(uffd_, UFFDIO_COPY, &uffd_copy), 0)
       << "ioctl_userfaultfd: copy failed: " << strerror(errno) << ". src:" << buffer
       << " dst:" << dst;
-  DCHECK_EQ(uffd_copy.copy, static_cast<ssize_t>(kPageSize));
+  DCHECK_EQ(uffd_copy.copy, static_cast<ssize_t>(length));
 }
 
 template <int kMode, typename CompactionFn>
-void MarkCompact::DoPageCompactionWithStateChange(size_t page_idx,
-                                                  size_t status_arr_len,
+bool MarkCompact::DoPageCompactionWithStateChange(size_t page_idx,
                                                   uint8_t* to_space_page,
                                                   uint8_t* page,
+                                                  bool map_immediately,
                                                   CompactionFn func) {
-  PageState expected_state = PageState::kUnprocessed;
-  PageState desired_state =
-      kMode == kCopyMode ? PageState::kProcessingAndMapping : PageState::kProcessing;
+  uint32_t expected_state = static_cast<uint8_t>(PageState::kUnprocessed);
+  uint32_t desired_state = static_cast<uint8_t>(map_immediately ? PageState::kProcessingAndMapping :
+                                                                  PageState::kProcessing);
   // In the concurrent case (kMode != kFallbackMode) we need to ensure that the update
   // to moving_spaces_status_[page_idx] is released before the contents of the page are
   // made accessible to other threads.
@@ -2081,32 +2086,57 @@ void MarkCompact::DoPageCompactionWithStateChange(size_t page_idx,
                                     expected_state, desired_state, std::memory_order_acquire)) {
     func();
     if (kMode == kCopyMode) {
-      CopyIoctl(to_space_page, page);
-      if (use_uffd_sigbus_) {
+      if (map_immediately) {
+        CopyIoctl(to_space_page, page, kPageSize);
+        // Store is sufficient as no other thread could modify the status at this
+        // point. Relaxed order is sufficient as the ioctl will act as a fence.
+        moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
+                                             std::memory_order_relaxed);
+      } else {
+        // Add the src page's index in the status word.
+        DCHECK(from_space_map_.HasAddress(page));
+        DCHECK_LE(static_cast<size_t>(page - from_space_begin_),
+                  std::numeric_limits<uint32_t>::max());
+        uint32_t store_val = (page - from_space_begin_) / kPageSize;
+        store_val <<= kPageStateShift;
+        store_val |= static_cast<uint8_t>(PageState::kProcessed);
         // Store is sufficient as no other thread would modify the status at this point.
-        moving_pages_status_[page_idx].store(PageState::kProcessedAndMapped,
-                                             std::memory_order_release);
+        moving_pages_status_[page_idx].store(store_val, std::memory_order_release);
       }
     } else if (kMode == kMinorFaultMode) {
-      expected_state = PageState::kProcessing;
-      desired_state = PageState::kProcessed;
+      expected_state = static_cast<uint8_t>(PageState::kProcessing);
+      desired_state = static_cast<uint8_t>(PageState::kProcessed);
       // the CAS needs to be with release order to ensure that stores to the
       // page makes it to memory *before* other threads observe that it's
       // ready to be mapped.
       if (!moving_pages_status_[page_idx].compare_exchange_strong(
               expected_state, desired_state, std::memory_order_release)) {
         // Some mutator has requested to map the page after processing it.
-        DCHECK_EQ(expected_state, PageState::kProcessingAndMapping);
-        MapProcessedPages</*kFirstPageMapping=*/true>(
-            to_space_page, moving_pages_status_, page_idx, status_arr_len);
+        DCHECK_EQ(expected_state, static_cast<uint8_t>(PageState::kProcessingAndMapping));
       }
+      UNREACHABLE();
     }
+    return true;
   } else {
-    DCHECK_GT(expected_state, PageState::kProcessed);
+    // Only GC thread could have set the state to Processed.
+    DCHECK_NE(expected_state, static_cast<uint8_t>(PageState::kProcessed));
+    return false;
   }
 }
 
-void MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode) {
+static void BackOff(uint32_t i) {
+  static constexpr uint32_t kYieldMax = 5;
+  // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
+  if (i <= kYieldMax) {
+    sched_yield();
+  } else {
+    // nanosleep is not in the async-signal-safe list, but bionic implements it
+    // with a pure system call, so it should be fine.
+    NanoSleep(10000ull * (i - kYieldMax));
+  }
+}
+
+bool MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode, size_t end_idx_for_mapping) {
   // Thanks to sliding compaction, bump-pointer allocations, and reverse
   // compaction (see CompactMovingSpace) the logic here is pretty simple: find
   // the to-space page up to which compaction has finished, all the from-space
@@ -2116,7 +2146,8 @@ void MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode) {
   // Find the to-space page up to which the corresponding from-space pages can be
   // freed.
   for (; idx > cur_page_idx; idx--) {
-    PageState state = moving_pages_status_[idx - 1].load(std::memory_order_acquire);
+    PageState state = static_cast<PageState>(
+        static_cast<uint8_t>(moving_pages_status_[idx - 1].load(std::memory_order_acquire)));
     if (state == PageState::kMutatorProcessing) {
       // Some mutator is working on the page.
       break;
@@ -2128,7 +2159,7 @@ void MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode) {
   DCHECK_LE(idx, last_checked_reclaim_page_idx_);
   if (idx == last_checked_reclaim_page_idx_) {
     // Nothing to do.
-    return;
+    return false;
   }
 
   uint8_t* reclaim_begin;
@@ -2215,15 +2246,41 @@ void MarkCompact::FreeFromSpacePages(size_t cur_page_idx, int mode) {
     // lower than the reclaim range.
     break;
   }
-
+  bool ret = false;
   ssize_t size = last_reclaimed_page_ - reclaim_begin;
-  if (size >= kMinFromSpaceMadviseSize) {
+  if (size > kMinFromSpaceMadviseSize) {
+    // map all the pages in the range
+    if (cur_page_idx < end_idx_for_mapping) {
+      size_t len = MapMovingSpacePages(cur_page_idx, end_idx_for_mapping);
+      // For the pages that were not mapped by gc-thread have to be completed
+      // before we madvise them. So wait for there status to change to 'mapped'.
+      for (size_t i = cur_page_idx + len / kPageSize; i < end_idx_for_mapping; i++) {
+        PageState state = static_cast<PageState>(
+            static_cast<uint8_t>(moving_pages_status_[i].load(std::memory_order_relaxed)));
+        uint32_t backoff_count = 0;
+        while (state != PageState::kProcessedAndMapped) {
+          BackOff(backoff_count++);
+          state = static_cast<PageState>(
+              static_cast<uint8_t>(moving_pages_status_[i].load(std::memory_order_relaxed)));
+        }
+      }
+      ret = true;
+    }
+    // Retain few pages for subsequent compactions.
+    const ssize_t gBufferPages = 4 * kPageSize;
+    DCHECK_LT(gBufferPages, kMinFromSpaceMadviseSize);
+    size -= gBufferPages;
+    uint8_t* addr = last_reclaimed_page_ - size;
     int behavior = minor_fault_initialized_ ? MADV_REMOVE : MADV_DONTNEED;
-    CHECK_EQ(madvise(reclaim_begin + from_space_slide_diff_, size, behavior), 0)
+    CHECK_EQ(madvise(addr + from_space_slide_diff_, size, behavior), 0)
         << "madvise of from-space failed: " << strerror(errno);
-    last_reclaimed_page_ = reclaim_begin;
+    last_reclaimed_page_ = addr;
+    cur_reclaimable_page_ = addr;
   }
+  CHECK_LE(reclaim_begin, last_reclaimable_page_);
+  last_reclaimable_page_ = reclaim_begin;
   last_checked_reclaim_page_idx_ = idx;
+  return ret;
 }
 
 void MarkCompact::UpdateClassAfterObjMap() {
@@ -2276,6 +2333,8 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
   UpdateClassAfterObjMap();
   // These variables are maintained by FreeFromSpacePages().
   last_reclaimed_page_ = pre_compact_page;
+  last_reclaimable_page_ = last_reclaimed_page_;
+  cur_reclaimable_page_ = last_reclaimed_page_;
   last_checked_reclaim_page_idx_ = idx;
   class_after_obj_iter_ = class_after_obj_ordered_map_.rbegin();
   // Allocated-black pages
@@ -2294,9 +2353,9 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
     uint32_t first_chunk_size = black_alloc_pages_first_chunk_size_[idx];
     if (first_obj != nullptr) {
       DoPageCompactionWithStateChange<kMode>(idx,
-                                             page_status_arr_len,
                                              to_space_end,
                                              page,
+                                             /*map_immediately=*/true,
                                              [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
                                                SlideBlackPage(first_obj,
                                                               next_page_first_obj,
@@ -2308,13 +2367,16 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
       // We are sliding here, so no point attempting to madvise for every
       // page. Wait for enough pages to be done.
       if (idx % (kMinFromSpaceMadviseSize / kPageSize) == 0) {
-        FreeFromSpacePages(idx, kMode);
+        FreeFromSpacePages(idx, kMode, 0);
       }
     }
     next_page_first_obj = first_obj;
   }
   DCHECK_EQ(pre_compact_page, black_allocations_begin_);
-
+  // Page to use if we can't any reclaimable page available to be used for
+  // processing.
+  uint8_t* reserve_page = page;
+  size_t end_idx_for_mapping = idx;
   while (idx > 0) {
     idx--;
     to_space_end -= kPageSize;
@@ -2323,15 +2385,78 @@ void MarkCompact::CompactMovingSpace(uint8_t* page) {
       page = shadow_space_end;
     } else if (kMode == kFallbackMode) {
       page = to_space_end;
+    } else {
+      DCHECK_EQ(kMode, kCopyMode);
+      if (cur_reclaimable_page_ > last_reclaimable_page_) {
+        cur_reclaimable_page_ -= kPageSize;
+        page = cur_reclaimable_page_ + from_space_slide_diff_;
+      } else {
+        page = reserve_page;
+      }
     }
     mirror::Object* first_obj = first_objs_moving_space_[idx].AsMirrorPtr();
-    DoPageCompactionWithStateChange<kMode>(
-        idx, page_status_arr_len, to_space_end, page, [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
+    bool success = DoPageCompactionWithStateChange<kMode>(
+        idx, to_space_end, page, page == reserve_page, [&]() REQUIRES_SHARED(Locks::mutator_lock_) {
           CompactPage(first_obj, pre_compact_offset_moving_space_[idx], page, kMode == kCopyMode);
         });
-    FreeFromSpacePages(idx, kMode);
+    if (kMode == kCopyMode && (!success || page == reserve_page) && end_idx_for_mapping - idx > 1) {
+      // map the pages in the following pages as they can't be mapped with
+      // the subsequent pages as their src-side pages won't be contiguous.
+      MapMovingSpacePages(idx + 1, end_idx_for_mapping);
+    }
+    if (FreeFromSpacePages(idx, kMode, end_idx_for_mapping)) {
+      end_idx_for_mapping = idx;
+    }
+  }
+  // map one last time to finish anything left.
+  if (end_idx_for_mapping > 0) {
+    MapMovingSpacePages(idx, end_idx_for_mapping);
   }
   DCHECK_EQ(to_space_end, bump_pointer_space_->Begin());
+}
+
+size_t MarkCompact::MapMovingSpacePages(size_t arr_idx, size_t arr_len) {
+  // Claim all the contiguous pages, which are ready to be mapped, and then do
+  // so in a single ioctl. This helps avoid the overhead of invoking syscall
+  // several times and also maps the already-processed pages, avoiding
+  // unnecessary faults on them.
+  DCHECK_LT(arr_idx, arr_len);
+  const size_t page_size = kPageSize;
+  uint32_t cur_state = moving_pages_status_[arr_idx].load(std::memory_order_relaxed);
+  if ((cur_state & kPageStateMask) != static_cast<uint8_t>(PageState::kProcessed)) {
+    return 0;
+  }
+  uint32_t from_space_idx = cur_state >> kPageStateShift;
+  uint8_t* to_space_start = moving_space_begin_ + arr_idx * page_size;
+  uint8_t* from_space_start = from_space_begin_ + from_space_idx * page_size;
+  DCHECK_ALIGNED_PARAM(to_space_start, page_size);
+  DCHECK_ALIGNED_PARAM(from_space_start, page_size);
+  size_t length = 0;
+  for (size_t i = arr_idx; i < arr_len; length += page_size, i++) {
+    uint8_t desired_state = static_cast<uint8_t>(PageState::kProcessedAndMapping);
+    cur_state = moving_pages_status_[i].load(std::memory_order_relaxed);
+    // We need to guarantee that we don't end up sucsessfully marking a later
+    // page 'mapping' and then fail to mark an earlier page. To guarantee that
+    // we use acq_rel order.
+    if ((cur_state & kPageStateMask) != static_cast<uint8_t>(PageState::kProcessed) ||
+        !moving_pages_status_[i].compare_exchange_strong(
+            cur_state, desired_state, std::memory_order_acq_rel)) {
+      break;
+    }
+    DCHECK_EQ(from_space_idx++, cur_state >> kPageStateShift);
+  }
+  if (length > 0) {
+    CopyIoctl(to_space_start, from_space_start, length);
+    for (size_t i = arr_idx; length > 0; length -= page_size, i++) {
+      // It's sufficient to use relaxed memory-order as these stores are
+      // happening after ioctl, which acts as a fence.
+      // Store is sufficient as there are no other threads updating status of
+      // these pages.
+      moving_pages_status_[i].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
+                                    std::memory_order_relaxed);
+    }
+  }
+  return length;
 }
 
 void MarkCompact::UpdateNonMovingPage(mirror::Object* first, uint8_t* page) {
@@ -2851,17 +2976,6 @@ void MarkCompact::CompactionPause() {
     // TODO: We can reduce the time spent on this in a pause by performing one
     // round of this concurrently prior to the pause.
     UpdateMovingSpaceBlackAllocations();
-    // TODO: If we want to avoid this allocation in a pause then we will have to
-    // allocate an array for the entire moving-space size, which can be made
-    // part of info_map_.
-    moving_pages_status_ = new Atomic<PageState>[moving_first_objs_count_ + black_page_count_];
-    if (kIsDebugBuild) {
-      size_t len = moving_first_objs_count_ + black_page_count_;
-      for (size_t i = 0; i < len; i++) {
-          CHECK_EQ(moving_pages_status_[i].load(std::memory_order_relaxed),
-                   PageState::kUnprocessed);
-      }
-    }
     // Iterate over the allocation_stack_, for every object in the non-moving
     // space:
     // 1. Mark the object in live bitmap
@@ -2869,7 +2983,6 @@ void MarkCompact::CompactionPause() {
     // 3. In the corresponding page, if the first-object vector needs updating
     // then do so.
     UpdateNonMovingSpaceBlackAllocations();
-
     // This store is visible to mutator (or uffd worker threads) as the mutator
     // lock's unlock guarantees that.
     compacting_ = true;
@@ -3288,18 +3401,6 @@ bool MarkCompact::SigbusHandler(siginfo_t* info) {
   }
 }
 
-static void BackOff(uint32_t i) {
-  static constexpr uint32_t kYieldMax = 5;
-  // TODO: Consider adding x86 PAUSE and/or ARM YIELD here.
-  if (i <= kYieldMax) {
-    sched_yield();
-  } else {
-    // nanosleep is not in the async-signal-safe list, but bionic implements it
-    // with a pure system call, so it should be fine.
-    NanoSleep(10000ull * (i - kYieldMax));
-  }
-}
-
 template <int kMode>
 void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
                                                 uint8_t* buf,
@@ -3335,125 +3436,115 @@ void MarkCompact::ConcurrentlyProcessMovingPage(uint8_t* fault_page,
   if (first_obj == nullptr) {
     // We should never have a case where two workers are trying to install a
     // zeropage in this range as we synchronize using moving_pages_status_[page_idx].
-    PageState expected_state = PageState::kUnprocessed;
+    uint32_t expected_state = static_cast<uint8_t>(PageState::kUnprocessed);
     if (moving_pages_status_[page_idx].compare_exchange_strong(
-            expected_state, PageState::kProcessedAndMapping, std::memory_order_relaxed)) {
+            expected_state,
+            static_cast<uint8_t>(PageState::kProcessedAndMapping),
+            std::memory_order_relaxed)) {
       // Note: ioctl acts as an acquire fence.
       ZeropageIoctl(fault_page, /*tolerate_eexist=*/false, /*tolerate_enoent=*/true);
     } else {
-      DCHECK_EQ(expected_state, PageState::kProcessedAndMapping);
+      DCHECK_EQ(expected_state, static_cast<uint8_t>(PageState::kProcessedAndMapping));
     }
     return;
   }
 
-  PageState state = moving_pages_status_[page_idx].load(
+  uint32_t raw_state = moving_pages_status_[page_idx].load(
       use_uffd_sigbus_ ? std::memory_order_acquire : std::memory_order_relaxed);
   uint32_t backoff_count = 0;
+  PageState state;
   while (true) {
-    switch (state) {
-      case PageState::kUnprocessed: {
-        // The increment to the in-progress counter must be done before updating
-        // the page's state. Otherwise, we will end up leaving a window wherein
-        // the GC-thread could observe that no worker is working on compaction
-        // and could end up unregistering the moving space from userfaultfd.
-        ScopedInProgressCount spc(this);
-        // Acquire order to ensure we don't start writing to shadow map, which is
-        // shared, before the CAS is successful. Release order to ensure that the
-        // increment to moving_compactions_in_progress above is not re-ordered
-        // after the CAS.
-        if (moving_pages_status_[page_idx].compare_exchange_strong(
-                state, PageState::kMutatorProcessing, std::memory_order_acq_rel)) {
-          if (kMode == kMinorFaultMode) {
-            DCHECK_EQ(buf, nullptr);
-            buf = shadow_to_space_map_.Begin() + page_idx * kPageSize;
-          } else if (UNLIKELY(buf == nullptr)) {
-            DCHECK_EQ(kMode, kCopyMode);
-            uint16_t idx = compaction_buffer_counter_.fetch_add(1, std::memory_order_relaxed);
-            // The buffer-map is one page bigger as the first buffer is used by GC-thread.
-            CHECK_LE(idx, kMutatorCompactionBufferCount);
-            buf = compaction_buffers_map_.Begin() + idx * kPageSize;
-            DCHECK(compaction_buffers_map_.HasAddress(buf));
-            Thread::Current()->SetThreadLocalGcBuffer(buf);
-          }
+    state = static_cast<PageState>(static_cast<uint8_t>(raw_state));
+    if (state == PageState::kProcessing || state == PageState::kMutatorProcessing ||
+        state == PageState::kProcessingAndMapping || state == PageState::kProcessedAndMapping) {
+      if (use_uffd_sigbus_) {
+        // Wait for the page to be mapped before returning.
+        BackOff(backoff_count++);
+        raw_state = moving_pages_status_[page_idx].load(std::memory_order_acquire);
+        continue;
+      } else {
+        break;
+      }
+    } else if (state == PageState::kProcessedAndMapped) {
+      // Nothing to do.
+      break;
+    } else {
+      // The increment to the in-progress counter must be done before updating
+      // the page's state. Otherwise, we will end up leaving a window wherein
+      // the GC-thread could observe that no worker is working on compaction
+      // and could end up unregistering the moving space from userfaultfd.
+      ScopedInProgressCount spc(this);
+      // Acquire order to ensure we don't start writing to shadow map, which is
+      // shared, before the CAS is successful. Release order to ensure that the
+      // increment to moving_compaction_in_progress above is not re-ordered
+      // after the CAS.
+      if (state == PageState::kUnprocessed &&
+          moving_pages_status_[page_idx].compare_exchange_strong(
+              raw_state,
+              static_cast<uint8_t>(PageState::kMutatorProcessing),
+              std::memory_order_acq_rel)) {
+        if (kMode == kMinorFaultMode) {
+          DCHECK_EQ(buf, nullptr);
+          buf = shadow_to_space_map_.Begin() + page_idx * kPageSize;
+        } else if (UNLIKELY(buf == nullptr)) {
+          DCHECK_EQ(kMode, kCopyMode);
+          uint16_t idx = compaction_buffer_counter_.fetch_add(1, std::memory_order_relaxed);
+          // The buffer-map is one page bigger as the first buffer is used by GC-thread.
+          CHECK_LE(idx, kMutatorCompactionBufferCount);
+          buf = compaction_buffers_map_.Begin() + idx * kPageSize;
+          DCHECK(compaction_buffers_map_.HasAddress(buf));
+          Thread::Current()->SetThreadLocalGcBuffer(buf);
+        }
 
-          if (fault_page < post_compact_end_) {
-            // The page has to be compacted.
-            CompactPage(
-                first_obj, pre_compact_offset_moving_space_[page_idx], buf, kMode == kCopyMode);
-          } else {
-            DCHECK_NE(first_obj, nullptr);
-            DCHECK_GT(pre_compact_offset_moving_space_[page_idx], 0u);
-            uint8_t* pre_compact_page = black_allocations_begin_ + (fault_page - post_compact_end_);
-            uint32_t first_chunk_size = black_alloc_pages_first_chunk_size_[page_idx];
-            mirror::Object* next_page_first_obj = nullptr;
-            if (page_idx + 1 < moving_first_objs_count_ + black_page_count_) {
-              next_page_first_obj = first_objs_moving_space_[page_idx + 1].AsMirrorPtr();
-            }
-            DCHECK(IsAligned<kPageSize>(pre_compact_page));
-            SlideBlackPage(first_obj,
-                           next_page_first_obj,
-                           first_chunk_size,
-                           pre_compact_page,
-                           buf,
-                           kMode == kCopyMode);
+        if (fault_page < post_compact_end_) {
+          // The page has to be compacted.
+          CompactPage(
+              first_obj, pre_compact_offset_moving_space_[page_idx], buf, kMode == kCopyMode);
+        } else {
+          DCHECK_NE(first_obj, nullptr);
+          DCHECK_GT(pre_compact_offset_moving_space_[page_idx], 0u);
+          uint8_t* pre_compact_page = black_allocations_begin_ + (fault_page - post_compact_end_);
+          uint32_t first_chunk_size = black_alloc_pages_first_chunk_size_[page_idx];
+          mirror::Object* next_page_first_obj = nullptr;
+          if (page_idx + 1 < moving_first_objs_count_ + black_page_count_) {
+            next_page_first_obj = first_objs_moving_space_[page_idx + 1].AsMirrorPtr();
           }
-          // Nobody else would simultaneously modify this page's state so an
-          // atomic store is sufficient. Use 'release' order to guarantee that
-          // loads/stores to the page are finished before this store.
-          moving_pages_status_[page_idx].store(PageState::kProcessedAndMapping,
+          DCHECK(IsAlignedParam(pre_compact_page, kPageSize));
+          SlideBlackPage(first_obj,
+                         next_page_first_obj,
+                         first_chunk_size,
+                         pre_compact_page,
+                         buf,
+                         kMode == kCopyMode);
+        }
+        // Nobody else would simultaneously modify this page's state so an
+        // atomic store is sufficient. Use 'release' order to guarantee that
+        // loads/stores to the page are finished before this store.
+        moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapping),
+                                             std::memory_order_release);
+        if (kMode == kCopyMode) {
+          CopyIoctl(fault_page, buf, kPageSize);
+          // Store is sufficient as no other thread modifies the status at this stage.
+          moving_pages_status_[page_idx].store(static_cast<uint8_t>(PageState::kProcessedAndMapped),
                                                std::memory_order_release);
-          if (kMode == kCopyMode) {
-            CopyIoctl(fault_page, buf);
-            if (use_uffd_sigbus_) {
-              // Store is sufficient as no other thread modifies the status at this stage.
-              moving_pages_status_[page_idx].store(PageState::kProcessedAndMapped,
-                                                   std::memory_order_release);
-            }
-            return;
-          } else {
-            break;
-          }
+          break;
+        } else {
+          // We don't support minor-fault feature anymore.
+          UNREACHABLE();
         }
       }
-        continue;
-      case PageState::kProcessing:
-        DCHECK_EQ(kMode, kMinorFaultMode);
-        if (moving_pages_status_[page_idx].compare_exchange_strong(
-                state, PageState::kProcessingAndMapping, std::memory_order_relaxed) &&
-            !use_uffd_sigbus_) {
-          // Somebody else took or will take care of finishing the compaction and
-          // then mapping the page.
-          return;
+      state = static_cast<PageState>(static_cast<uint8_t>(raw_state));
+      if (state == PageState::kProcessed) {
+        size_t arr_len = moving_first_objs_count_ + black_page_count_;
+        // The page is processed but not mapped. We should map it. The release
+        // order used in MapMovingSpacePages wil ensure that the increment to
+        // moving_compaction_in_progress is done first.
+        if (MapMovingSpacePages(page_idx, arr_len) >= kPageSize) {
+          break;
         }
-        continue;
-      case PageState::kProcessed:
-        // The page is processed but not mapped. We should map it.
-        break;
-      case PageState::kProcessingAndMapping:
-      case PageState::kMutatorProcessing:
-      case PageState::kProcessedAndMapping:
-        if (use_uffd_sigbus_) {
-          // Wait for the page to be mapped before returning.
-          BackOff(backoff_count++);
-          state = moving_pages_status_[page_idx].load(std::memory_order_acquire);
-          continue;
-        }
-        return;
-      case PageState::kProcessedAndMapped:
-        // Somebody else took care of the page.
-        return;
+        raw_state = moving_pages_status_[page_idx].load(std::memory_order_acquire);
+      }
     }
-    break;
-  }
-
-  DCHECK_EQ(kMode, kMinorFaultMode);
-  if (state == PageState::kUnprocessed) {
-    MapProcessedPages</*kFirstPageMapping=*/true>(
-        fault_page, moving_pages_status_, page_idx, nr_moving_space_used_pages);
-  } else {
-    DCHECK_EQ(state, PageState::kProcessed);
-    MapProcessedPages</*kFirstPageMapping=*/false>(
-        fault_page, moving_pages_status_, page_idx, nr_moving_space_used_pages);
   }
 }
 
@@ -3463,7 +3554,7 @@ void MarkCompact::MapUpdatedLinearAllocPage(uint8_t* page,
                                             bool page_touched) {
   DCHECK(!minor_fault_initialized_);
   if (page_touched) {
-    CopyIoctl(page, shadow_page);
+    CopyIoctl(page, shadow_page, kPageSize);
   } else {
     // If the page wasn't touched, then it means it is empty and
     // is most likely not present on the shadow-side. Furthermore,
@@ -4461,7 +4552,6 @@ void MarkCompact::FinishPhase() {
     }
   }
   class_after_obj_ordered_map_.clear();
-  delete[] moving_pages_status_;
   linear_alloc_arenas_.clear();
   {
     ReaderMutexLock mu(thread_running_gc_, *Locks::mutator_lock_);
